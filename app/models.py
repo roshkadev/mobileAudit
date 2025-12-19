@@ -67,6 +67,7 @@ class Scan(models.Model):
     status = models.CharField(max_length=50,blank=True, null=True)
     progress = models.IntegerField(blank=True, null=True)
     findings = models.IntegerField(blank=True, null=True, default=0)
+    score = models.IntegerField(default=100, null=True, blank=True)
     apk_name = models.CharField(max_length=255, blank=True, null=True)
     file_size = models.CharField(max_length=255, blank=True, null=True)
     md5 = models.CharField(max_length=255, blank=True, null=True)

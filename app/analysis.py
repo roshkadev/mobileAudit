@@ -6,16 +6,17 @@ from django.conf import settings
 import logging, os, threading, hashlib, re, linecache, base64, urllib
 from app.models import *
 from pygments import highlight
-from pygments.lexers import PythonLexer
 from pygments.formatters import HtmlFormatter
-from pygments.lexers import guess_lexer, guess_lexer_for_filename
+from pygments.lexers import guess_lexer, guess_lexer_for_filename, PythonLexer
 from datetime import datetime
 from app.integration import *
+from django.db.models import F
 
 logger = logging.getLogger('app')
 
 APK_PATH = ""
 DECOMPILE_PATH = ""
+_cached_root = {}
 
 def set_hash_app(scan):
     if not scan.sha256:
@@ -269,89 +270,105 @@ def get_match_lines(content, position):
             # endline
             return (beginline, lines)
 
-def find_patterns(i, prev_line, line, name, dir, scan):
-    patterns = Pattern.objects.filter(active=True)
-    url = ''
-    m = ''
-    for p in patterns:
-        pattern = re.compile(p.pattern, re.MULTILINE)
-        try:
-            for match in pattern.finditer(line):
-                if match.group():
-                    type = ''
-                    match_str = match.group()
-                    if (p.id == 8):
-                        type = 'IP'
-                    elif (p.id == 9):
-                        type = 'URL'
-                        try:
-                            if "schemas.android.com" in line:
-                                break
-                            url = urllib.parse.urlsplit(match_str)
-                            if (settings.MALWARE_ENABLED):
-                                m = Malware.objects.get(url__icontains=url.netloc)
-                        except Exception as e:
-                            logger.error("not found " + match_str)
-                    elif (p.id == 10):
-                        type = 'email'
-                    elif (p.id == 11):
-                        type = 'DNI'
-                    elif (p.id == 12):
-                        type = 'username'
-                    elif (p.id == 13):
-                        type = 'credentials'
-                    elif (p.id == 14):
-                        type = 'sensitive info'
-                    elif (p.id == 15):
-                        type = 'connection'
-                    elif(p.id == 21):
-                        try:
-                            int(match_str, 16)
-                            type = 'hex'
-                        except Exception as e:
-                            break
-                    elif (p.id == 22):
-                        if (base64.b64encode(base64.b64decode(match_str)) != match_str):
-                            break
-                        type = 'base64'
 
-                    match_lines = get_match_lines(line, get_position(match))
-                    snippet = match_lines[1]
-                    position = match_lines[0]
-                    if (not snippet):
-                        snippet = line
-                
-                    finding = Finding(
-                        scan = scan,
-                        path = name.replace(dir, ""),
-                        line_number = position,
-                        line = match_str,
-                        snippet = snippet,
-                        match = match_str,
-                        status = Status.TD,
-                        type = p,
-                        name = p.default_name,
-                        description = p.default_description,
-                        severity = p.default_severity,
-                        mitigation = p.default_mitigation,
-                        cwe = p.default_cwe,
-                        risk = p.default_risk,
-                        user = scan.user
-                    )
-                    finding.save()
-                    scan.findings = int(scan.findings) + 1
-                    scan.save()
-                    if (type != ''):
-                        s = String(type = type, value = match_str, scan = scan, finding = finding)
-                        s.save()
-                        if (type == 'URL'):
-                            if (m):
-                                u = Domain(scan = scan, domain = url.netloc, finding = finding, malware = m)
-                            else:
-                                u = Domain(scan = scan, domain = url.netloc, finding = finding)
-                            u.save()
+def find_patterns(i, prev_line, content, name, dir, scan):
+    NS_ANDROID = "{http://schemas.android.com/apk/res/android}"
+    
+    # 1. IDENTIFICACIÓN DINÁMICA DEL PAQUETE RAÍZ
+    if scan.id not in _cached_root:
+        try:
+            apk_obj = APK(scan.apk.path)
+            manifest_xml = apk_obj.get_android_manifest_xml()
+            injected_root = None
+            
+            # Buscar metadato inyectado por Gradle
+            for meta in manifest_xml.findall(".//meta-data"):
+                if meta.get(f"{NS_ANDROID}name") == "project_root_package":
+                    injected_root = meta.get(f"{NS_ANDROID}value")
+            
+            if injected_root:
+                _cached_root[scan.id] = injected_root.replace('.', '/')
+                print(f"📦 [CONFIG] Root Package detectado: {_cached_root[scan.id]}", flush=True)
+            else:
+                # Fallback: Usar los primeros 3 niveles del package name
+                parts = scan.package.split('.')
+                _cached_root[scan.id] = "/".join(parts[:3]) if len(parts) >= 3 else "/".join(parts[:2])
+                print(f"⚠️ [CONFIG] Fallback a Root Package: {_cached_root[scan.id]}", flush=True)
         except Exception as e:
-            logger.error(e)
+            _cached_root[scan.id] = scan.package.replace('.', '/')
+            print(f"❌ [ERROR] Fallo al leer APK: {e}", flush=True)
+
+    root_package = _cached_root[scan.id]
+
+    # 2. FILTROS DE EXCLUSIÓN AGRESIVOS (Human-made code only)
+    is_internal = root_package in name
+    
+    # Solo procesamos código interno relevante
+    if not name.endswith(('.java', '.kt', '.xml')) or not is_internal:
+        return
+
+    # Patrones para ignorar archivos generados y de configuración (DI)
+    ignored_path_patterns = [
+        '_Factory', '_Hilt', '_Singleton', '_MembersInjector', 
+        'Dagger', 'Directions', 'Args', 'ViewBinding', 'BuildConfig',
+        'NetworkModule', 'DataModule', 'AppModule'
+    ]
+    
+    # Firmas de código de archivos generados o de configuración que disparan falsos positivos
+    is_generated_content = any(attr in content for attr in [
+        'implements Factory', 
+        '@Module', 
+        '@Provides', 
+        'dagger.internal',
+        'Preconditions.checkNotNullFromProvides'
+    ])
+
+    if any(p in name for p in ignored_path_patterns) or is_generated_content:
+        # Si detectamos código generado o de inyección, lo saltamos
+        return
+
+    # 3. LIMPIEZA DE CONTENIDO PARA ANÁLISIS
+    # Filtramos anotaciones y metadatos que causan falsos positivos (como @SerializedName)
+    lines = content.split('\n')
+    clean_lines = [l for l in lines if not l.strip().startswith(('@', 'import', 'package'))]
+    analysis_content = "\n".join(clean_lines)
+
+    # 4. MOTOR DE ESCANEO DE PATRONES
+    patterns = Pattern.objects.filter(active=True)
+    for p in patterns:
+        regex = re.compile(p.pattern, re.MULTILINE | re.IGNORECASE)
+        try:
+            for match in regex.finditer(analysis_content):
+                if match.group():
+                    match_str = match.group().strip()[:500]
+                    
+                    # Obtención de atributos del modelo Pattern
+                    p_name = getattr(p, 'name', getattr(p, 'default_name', 'Vulnerabilidad'))
+                    p_sev = getattr(p, 'severity', getattr(p, 'default_severity', Severity.NO))
+                    p_cwe = getattr(p, 'cwe', getattr(p, 'default_cwe', 'CWE-000'))
+                    p_desc = getattr(p, 'description', getattr(p, 'default_description', ''))
+
+                    # Persistencia del hallazgo
+                    Finding.objects.create(
+                        scan=scan,
+                        path=name.replace(dir, ""),
+                        name=p_name,
+                        severity=p_sev,
+                        description=p_desc,
+                        line=match_str,
+                        match=match_str,
+                        status=Status.TD,
+                        cwe=p_cwe,
+                        user=scan.user
+                    )
+                    
+                    # Actualización atómica en la base de datos
+                    Scan.objects.filter(id=scan.id).update(findings=F('findings') + 1)
+                    print(f"✅ [MATCH] {p_name} encontrado en: {name}", flush=True)
+                    
+        except Exception as e:
+            print(f"❌ [ERROR REGEX] en {name}: {e}", flush=True)
+            
          
 def get_lines(finding='', path=''):
     formatter = HtmlFormatter(linenos=False, cssclass="source")
@@ -433,3 +450,30 @@ def get_info_database(scan, path):
         table_info = f.read() 
         db = DatabaseInfo(scan=scan, table='None', info=table_info)
         db.save()
+
+def calculate_final_score(scan_id):
+    """
+    Calcula el Health Score (0-100) basado solo en hallazgos relevantes.
+    """
+    scan = Scan.objects.get(pk=scan_id)
+    findings = Finding.objects.filter(scan=scan)
+    
+    # Pesos de penalización por severidad
+    weights = {
+        'CR': 25, # Critical
+        'HI': 15, # High
+        'ME': 5,  # Medium
+        'LO': 1,  # Low
+        'NO': 0   # None (Librerías externas)
+    }
+    
+    total_penalty = 0
+    for f in findings:
+        total_penalty += weights.get(f.severity, 0)
+    
+    # Iniciamos en 100 y restamos penalizaciones
+    final_score = max(0, 100 - total_penalty)
+    
+    scan.score = final_score
+    scan.save()
+    logger.info(f"Score final calculado para scan {scan_id}: {final_score}")
