@@ -47,6 +47,7 @@
                             <th style="width: 10%;">VT</th>
                             {% endif %}
                             <th style="width: 10%;">Findings</th>
+                            <th style="width: 10%;">Score</th> 
                             <th style="width: 30%;">By Severity</th>
                             {% if user.is_authenticated %}
                             <th style="width: 5%;">Delete</th>
@@ -69,6 +70,16 @@
                             {% endif %} {% endif %}
                             <td><a href="{% url 'findings' scan_id=scan.id %}" target="_blank" rel="noopener noreferrer">{{ scan.findings }}</a></td>
                             <td>
+                                <span class="badge 
+                                    {% if scan.score >= 80 %}text-success
+                                    {% elif scan.score >= 50 %}text-warning
+                                    {% else %}text-danger{% endif %}" 
+                                    style="font-size: 1.1em; font-weight: bold; color: black !important;">
+                                    {{ scan.score }}/100
+                                </span>
+                            </td>
+                            <td>
+
                                 <table class="table table-borderless">
                                     {% for severity, number in scan_data.findings.items %}
                                     <tr>
